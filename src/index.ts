@@ -5,5 +5,6 @@ declare global {
 }
 
 addEventListener('fetch', (event) => {
+  console.log(event.request.url)
   event.respondWith(handleRequest(event.request))
 })

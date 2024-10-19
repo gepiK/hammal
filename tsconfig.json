@@ -14,10 +14,10 @@
   },
   "include": [
     "./src/*.ts",
-    "./test/*.ts",
+    "test.js/*.ts",
     "./src/**/*.ts",
-    "./test/**/*.ts",
+    "test.js/**/*.ts",
     "./node_modules/@cloudflare/workers-types/index.d.ts"
-  ],
+, "src/index.js", "src/handler.js"  ],
   "exclude": ["node_modules/", "dist/"]
 }
