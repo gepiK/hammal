@@ -1,12 +1,8 @@
 // 利用CloudFlare搭建一个专属的Docker镜像加速和代理工具
 
 
-// Docker镜像仓库主机地址
-let hub_host = 'registry-1.docker.io';
-// Docker认证服务器地址
-const auth_url = 'https://auth.docker.io';
-// 自定义的工作服务器地址
-let workers_url = 'https://your.domain/';
+// Docker镜像仓库默认主机地址
+const DEFAULT_HUB_HOST = 'registry-1.docker.io';
 
 let 屏蔽爬虫UA = ['netcraft'];
 
@@ -28,7 +24,7 @@ function routeByHosts(host) {
   };
 
   if (host in routes) return [routes[host], false];
-  else return [hub_host, true];
+  else return [DEFAULT_HUB_HOST, true];
 }
 
 /** @type {RequestInit} */
@@ -192,19 +188,30 @@ async function searchInterface() {
 export default {
   async fetch(request, env, ctx) {
     const getReqHeader = (key) => request.headers.get(key); // 获取请求头
+    let hub_host = DEFAULT_HUB_HOST;
 
     let url = new URL(request.url); // 解析请求URL
     console.log(url)
     const userAgentHeader = request.headers.get('User-Agent');
     const userAgent = userAgentHeader ? userAgentHeader.toLowerCase() : "null";
-    if (env.UA) 屏蔽爬虫UA = 屏蔽爬虫UA.concat(await ADD(env.UA));
-    workers_url = `https://${url.hostname}`;
+    const blockedUA = env.UA ? 屏蔽爬虫UA.concat(await ADD(env.UA)) : 屏蔽爬虫UA;
+    const workers_url = `https://${url.hostname}`;
     const pathname = url.pathname;
     console.log('pathname',pathname)
     // 获取请求参数中的 ns
     const ns = url.searchParams.get('ns');
     const hostname = url.searchParams.get('hubhost') || url.hostname;
-    const hostTop = hostname==='hammal.gepik.work' ? pathname.startsWith('/v2') ?  pathname.split('/')[2] :pathname.split('/')[1] : hostname.split('.')[0]; // 获取主机名的第一部分
+    const routeKeys = ["quay", "gcr", "k8s-gcr", "k8s", "ghcr", "cloudsmith", "nvcr", "test"];
+    const pathParts = pathname.split('/').filter(Boolean);
+    let hostTop = hostname.split('.')[0]; // 默认使用子域
+    let hostTopFromPath = false;
+    if (pathParts[0] === 'v2' && pathParts[1] && routeKeys.includes(pathParts[1])) {
+      hostTop = pathParts[1];
+      hostTopFromPath = true;
+    } else if (pathParts[0] && routeKeys.includes(pathParts[0])) {
+      hostTop = pathParts[0];
+      hostTopFromPath = true;
+    } // 获取主机名的第一部分
 
     let checkHost; // 在这里定义 checkHost 变量
     // 如果存在 ns 参数，优先使用它来确定 hub_host
@@ -223,11 +230,29 @@ export default {
     console.log(`域名头部: ${hostTop}\n反代地址: ${hub_host}\n伪装首页: ${fakePage}`);
     const isUuid = isUUID(pathname.split('/')[1].split('/')[0]);
 
-    if (屏蔽爬虫UA.some(fxxk => userAgent.includes(fxxk)) && 屏蔽爬虫UA.length > 0) {
+    if (blockedUA.some(fxxk => userAgent.includes(fxxk)) && blockedUA.length > 0) {
       // 首页改成一个nginx伪装页
       return new Response(await nginx(), {
         headers: {
           'Content-Type': 'text/html; charset=UTF-8',
+        },
+      });
+    }
+
+    if (pathname === '/v2/' || pathname === '/v2') {
+      const tokenRealm = hub_host === 'registry-1.docker.io'
+        ? 'https://auth.docker.io/token'
+        : `https://${hub_host.replace(/\/+$/, '')}/token`;
+      const tokenService = hub_host === 'registry-1.docker.io' ? 'registry.docker.io' : hub_host;
+      const workerBase = workers_url.endsWith('/') ? workers_url.slice(0, -1) : workers_url;
+      const proxiedRealm = `${workerBase}/token?upstream=${encodeURIComponent(tokenRealm)}`;
+
+      return new Response(JSON.stringify({ errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }] }), {
+        status: 401,
+        headers: {
+          'Content-Type': 'application/json',
+          'docker-distribution-api-version': 'registry/2.0',
+          'Www-Authenticate': `Bearer realm="${proxiedRealm}",service="${tokenService}"`,
         },
       });
     }
@@ -294,21 +319,81 @@ export default {
       console.log(`handle_url: ${url}`);
     }
 
+    // 去掉路径前缀中的路由标识（例如 /ghcr/v2/... -> /v2/...）
+    if (hostTopFromPath && url.pathname.startsWith(`/${hostTop}`)) {
+      const segments = url.pathname.split('/');
+      // segments[0] 为空字符串，因为以 / 开头
+      // segments[1] 可能是 hostTop
+      if (segments[1] === hostTop) {
+        segments.splice(1, 1);
+        url.pathname = segments.join('/') || '/';
+        console.log(`strip host segment prefix: ${url.pathname}`);
+      }
+    }
+
+    // 去掉 /v2/{hostTop}/ 前缀中的路由标识（例如 /v2/ghcr/xxx -> /v2/xxx）
+    if (hostTopFromPath && url.pathname.startsWith('/v2/')) {
+      const segments = url.pathname.split('/');
+      if (segments[2] === hostTop) {
+        segments.splice(2, 1);
+        url.pathname = segments.join('/') || '/';
+        console.log(`strip host segment after /v2: ${url.pathname}`);
+      }
+    }
+
     // 处理token请求
     if (url.pathname.includes('/token')) {
-      let token_parameter = {
+      const searchParams = new URLSearchParams(url.search);
+      const upstream = searchParams.get('upstream');
+      searchParams.delete('upstream');
+
+      let target;
+      if (upstream) {
+        try {
+          target = new URL(upstream);
+        } catch (err) {
+          target = null;
+        }
+      }
+      if (!target) {
+        const defaultAuth = hub_host === 'registry-1.docker.io'
+          ? 'https://auth.docker.io/token'
+          : `https://${hub_host.replace(/\/+$/, '')}/token`;
+        target = new URL(defaultAuth);
+      }
+
+      searchParams.forEach((value, key) => target.searchParams.append(key, value));
+
+      const token_parameter = {
+        method: request.method,
         headers: {
-          'Host': 'auth.docker.io',
+          'Host': target.hostname,
           'User-Agent': getReqHeader("User-Agent"),
-          'Accept': getReqHeader("Accept"),
+          'Accept': 'application/json',
           'Accept-Language': getReqHeader("Accept-Language"),
-          'Accept-Encoding': getReqHeader("Accept-Encoding"),
           'Connection': 'keep-alive',
           'Cache-Control': 'max-age=0'
-        }
+        },
+        body: request.method !== 'GET' && request.method !== 'HEAD' ? await request.blob() : null,
+        redirect: 'follow'
       };
-      let token_url = auth_url + url.pathname + url.search;
-      return fetch(new Request(token_url, request), token_parameter);
+
+      if (request.headers.has("Authorization")) {
+        token_parameter.headers.Authorization = getReqHeader("Authorization");
+      }
+
+      const tokenResponse = await fetch(new Request(target.toString(), token_parameter));
+      const tokenBody = await tokenResponse.text();
+      const tokenHeaders = new Headers(tokenResponse.headers);
+      tokenHeaders.set('Content-Type', tokenHeaders.get('Content-Type') || 'application/json');
+      tokenHeaders.set('Content-Length', String(new TextEncoder().encode(tokenBody).length));
+      tokenHeaders.delete('Content-Encoding');
+      tokenHeaders.delete('Transfer-Encoding');
+      tokenHeaders.delete('Connection');
+      return new Response(tokenBody, {
+        status: tokenResponse.status,
+        headers: tokenHeaders,
+      });
     }
 
     // 修改 /v2/ 请求路径
@@ -316,8 +401,6 @@ export default {
       //url.pathname = url.pathname.replace(/\/v2\//, '/v2/library/');
       url.pathname = '/v2/library/' + url.pathname.split('/v2/')[1];
       console.log(`modified_url: ${url.pathname}`);
-    } else if(url.pathname.startsWith('/v2/')) {
-      url.pathname = url.pathname.split('/').slice(3).join('/');
     }
     console.log('修改后的url.pathname:', url.pathname)
     // 更改请求的主机名
@@ -333,8 +416,7 @@ export default {
         'Accept-Encoding': getReqHeader("Accept-Encoding"),
         'Connection': 'keep-alive',
         'Cache-Control': 'max-age=0'
-      },
-      cacheTtl: 3600 // 缓存时间
+      }
     };
 
     // 添加Authorization头
@@ -352,9 +434,15 @@ export default {
 
     // 修改 Www-Authenticate 头
     if (new_response_headers.get("Www-Authenticate")) {
-      let auth = new_response_headers.get("Www-Authenticate");
-      let re = new RegExp(auth_url, 'g');
-      new_response_headers.set("Www-Authenticate", response_headers.get("Www-Authenticate").replace(re, workers_url));
+      const auth = new_response_headers.get("Www-Authenticate");
+      const realmMatch = auth.match(/realm="([^"]+)"/i);
+      if (realmMatch) {
+        const upstreamRealm = realmMatch[1];
+        const workerBase = workers_url.endsWith('/') ? workers_url.slice(0, -1) : workers_url;
+        const proxiedRealm = `${workerBase}/token?upstream=${encodeURIComponent(upstreamRealm)}`;
+        const updatedAuth = auth.replace(realmMatch[0], `realm="${proxiedRealm}"`);
+        new_response_headers.set("Www-Authenticate", updatedAuth);
+      }
     }
 
     // 处理重定向
